@@ -30,97 +30,66 @@ class ResBlk(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, arch, hidden=64):
+    def __init__(self, arch, hidden=64, cls=512):
         super(Encoder, self).__init__()
         layers = [
-            Conv(3, hidden, 5),
+            nn.BatchNorm2d(2, affine=False),
+            Conv(2, hidden, 5),
             nn.ReLU(inplace=True),
             nn.BatchNorm2d(hidden),
         ]
 
-        b_vq = 128
         for l in arch:
             if l == 'r':
                 layers.append(ResBlk(hidden))
-            elif l == 'q':
-                layers.append(VQ(hidden, b_vq, dim=1))
             elif l == 'p':
                 layers.append(nn.AvgPool2d(3, 2, 1))
+            elif l == 'd':
+                layers.append(nn.Conv2d(hidden, hidden * 2, 1))
+                hidden *= 2
 
-        self.layers = nn.ModuleList(layers)
+        layers.append(nn.AdaptiveMaxPool2d(1))
+        self.layers = nn.Sequential(*layers)
+        self.to_prob = nn.Conv2d(hidden, cls, 1)
+
+        self.sobel = nn.Conv2d(1, 2, kernel_size=3, stride=1, padding=1)
+        self.sobel.weight.data[0, 0].copy_(
+                        torch.FloatTensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]])
+                    )
+        self.sobel.weight.data[1, 0].copy_(
+                        torch.FloatTensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]])
+                    )
+        self.sobel.bias.data.zero_()
+        for p in self.sobel.parameters():
+            p.requires_grad = False
+
 
     def forward(self, x, ret_idx=False):
-        qs = []
-        idxs = []
-        for m in self.layers:
-            if isinstance(m, VQ):
-                x, idx = m(x)
-                qs.append(x.detach())
-                idxs.append(idx)
-            else:
-                x = m(x)
-
-        if ret_idx:
-            return qs, idxs
-        else:
-            return qs
+        x = self.sobel(x.mean(dim=1, keepdim=True))
+        x = self.layers(x)
+        return self.to_prob(x).squeeze(), x.squeeze()
 
 
-class Decoder(nn.Module):
-    def __init__(self, arch, hidden=64):
-        super(Decoder, self).__init__()
-        layers = []
+class Noise(nn.Module):
+    def __init__(self, ch):
+        super(Noise, self).__init__()
+        self.a = nn.Parameter(torch.zeros(ch, 1, 1))
 
-        for l in arch:
-            if l == 'r':
-                layers.append(ResBlk(hidden))
-            elif l == 'u':
-                layers.append(nn.UpsamplingNearest2d(scale_factor=2))
-            elif l == 'c':
-                layers.append(nn.Conv2d(hidden*2, hidden, 1))
-
-        layers += [
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            Conv(hidden, 3, 3),
-            nn.Sigmoid()
-        ]
-
-        self.layers = nn.ModuleList(layers)
-
-    def forward(self, qs):
-        x = qs.pop()
-        for m in self.layers:
-            if isinstance(m, nn.Conv2d) and m.weight.shape[3] == 1:
-                q = qs.pop()
-                x = torch.cat([x, q], dim=1)
-            x = m(x)
-
-        return x
+    def forward(self, x):
+        return x + self.a * torch.randn_like(x)
 
 
-def AE(enc, dec):
-    return AE_initialize(nn.Sequential(Encoder(enc), Decoder(dec)))
-
-
-def AE_initialize(ae):
+def initialize(ae):
     for m in ae.modules():
         if isinstance(m, nn.Conv2d):
-            nn.init.xavier_uniform_(m.weight)
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
             nn.init.constant_(m.bias, 0)
         if isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
     return ae
 
-def baseline(sz):
-    if sz == 128:
-        return baseline_128()
-    if sz == 64:
-        return baseline_64()
+def baseline_64(cls):
+    return initialize(Encoder('rrdprdprdprpr', cls=cls))
 
-def baseline_64():
-    return AE('rrpqrrpq', 'rrucrrur')
-
-def baseline_128():
-    return AE('rrprrpqrrpq', 'rrucrrurrur')
